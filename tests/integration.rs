@@ -496,6 +496,22 @@ fn seeded_external_object_reads_back() {
     assert_eq!(read["cells"]["A1"]["value"].as_str().unwrap(), "seeded");
 }
 
+#[test]
+#[ignore = "needs Docker + integration feature"]
+fn seeded_object_reads_back_via_url() {
+    let stack = Stack::start().expect("stack");
+    let sheets = excel_fixture::fixture_bytes();
+    stack
+        .seed_object("workspaces/ws-9/att.xlsx", sheets)
+        .unwrap();
+    // The URL form a platform agent would hold: endpoint + bucket + key.
+    let url = format!("{}/uploads/workspaces/ws-9/att.xlsx", stack.s3_endpoint);
+    let read = stack
+        .tool_result_json("sheet_read", serde_json::json!({ "s3_key": url }), 40)
+        .unwrap();
+    assert_eq!(read["cells"]["A1"]["value"].as_str().unwrap(), "seeded");
+}
+
 /// Fixture builder local to the test crate (the binary crate's modules
 /// are not exported; build a workbook with umya directly).
 mod excel_fixture {

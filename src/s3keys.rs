@@ -55,6 +55,57 @@ pub fn validate_input_key(key: &str, s3: &S3Config) -> Result<String, InvalidKey
     Ok(key.to_string())
 }
 
+/// Resolve a tool's input key argument: a plain S3 key passes through; a
+/// full object-store URL (as found in platform attachment metadata) is
+/// converted to its key first. Either way the result is then validated by
+/// `validate_input_key`, so the security rules are identical for both
+/// forms.
+pub fn resolve_input(raw: &str, s3: &S3Config) -> Result<String, InvalidKey> {
+    let raw = raw.trim();
+    let Some(rest) = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+    else {
+        // Not a URL: plain key, validated as-is.
+        return validate_input_key(raw, s3);
+    };
+    // Drop the query string (presign signatures) before splitting.
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let (host, path) = match rest.split_once('/') {
+        Some(split) => split,
+        None => {
+            return Err(InvalidKey(format!(
+                "URL contains no object key (got '{raw}'); pass 's3_key' as a key or a URL like http://<endpoint>/{}/<key>",
+                s3.bucket
+            )));
+        }
+    };
+    // Virtual-host style: host is "<bucket>.<endpoint-domain>".
+    if let Some(domain) = host.strip_prefix(&format!("{}.", s3.bucket))
+        && !domain.is_empty()
+    {
+        return validate_input_key(path, s3);
+    }
+    // Bucket-only or trailing-slash URL: segment matches, but no key.
+    if path == s3.bucket || path == format!("{}/", s3.bucket) {
+        return Err(InvalidKey(format!(
+            "URL contains no object key (got '{raw}'); pass 's3_key' as a key or a URL like http://<endpoint>/{}/<key>",
+            s3.bucket
+        )));
+    }
+    // Path style: first path segment is the bucket.
+    let key = match path.strip_prefix(&format!("{}/", s3.bucket)) {
+        Some(key) => key,
+        None => {
+            return Err(InvalidKey(format!(
+                "URL host or first path segment does not match bucket '{}' (got '{raw}'); expected http://<endpoint>/{}/<key>",
+                s3.bucket, s3.bucket
+            )));
+        }
+    };
+    validate_input_key(key, s3)
+}
+
 /// Normalize an output key: validation minus the input allowlist (outputs
 /// go to `S3_OUTPUT_PREFIX`, not the input roots) plus the .xlsx suffix
 /// rule.
@@ -152,5 +203,105 @@ mod tests {
     fn output_key_rejects_traversal() {
         assert!(normalize_output_key("out/../etc/passwd.xlsx").is_err());
         assert!(normalize_output_key("/abs.xlsx").is_err());
+    }
+
+    // --- resolve_input: URL forms ---
+
+    fn url_s3() -> S3Config {
+        S3Config {
+            bucket: "uploads".into(),
+            region: "r".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            endpoint_url: "http://minio:9000".into(),
+            use_path_style: true,
+            allowed_key_prefixes: vec!["workspaces/".into()],
+        }
+    }
+
+    #[test]
+    fn resolve_plain_key_passthrough() {
+        let cfg = s3(&[]);
+        assert_eq!(
+            resolve_input("workspaces/a/b.xlsx", &cfg).unwrap(),
+            "workspaces/a/b.xlsx"
+        );
+    }
+
+    #[test]
+    fn resolve_path_style_url() {
+        // MinIO in-cluster form: endpoint + bucket + key in the path.
+        let cfg = url_s3();
+        assert_eq!(
+            resolve_input("http://minio:9000/uploads/workspaces/a/b.xlsx", &cfg).unwrap(),
+            "workspaces/a/b.xlsx"
+        );
+    }
+
+    #[test]
+    fn resolve_path_style_url_with_query() {
+        // Presigned URLs carry the signature in the query string.
+        let cfg = url_s3();
+        assert_eq!(
+            resolve_input(
+                "http://minio:9000/uploads/workspaces/a/b.xlsx?X-Amz-Signature=abc&X-Amz-Expires=600",
+                &cfg
+            )
+            .unwrap(),
+            "workspaces/a/b.xlsx"
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_host_style_url() {
+        // bucket.endpoint host: path starts directly at the key.
+        let cfg = url_s3();
+        assert_eq!(
+            resolve_input("https://uploads.s3.amazonaws.com/workspaces/a/b.xlsx", &cfg).unwrap(),
+            "workspaces/a/b.xlsx"
+        );
+    }
+
+    #[test]
+    fn resolve_url_still_enforces_key_rules() {
+        // Traversal smuggled in the URL path is caught by validate_input_key.
+        let cfg = url_s3();
+        assert!(resolve_input("http://minio:9000/uploads/../etc/passwd", &cfg).is_err());
+    }
+
+    #[test]
+    fn resolve_virtual_host_url_still_enforces_key_rules() {
+        // A traversal smuggled in the virtual-host URL path must be caught
+        // by validate_input_key, same as the path-style branch.
+        let cfg = url_s3();
+        assert!(resolve_input("https://uploads.s3.amazonaws.com/../etc/passwd", &cfg).is_err());
+    }
+
+    #[test]
+    fn resolve_bucket_only_url_has_no_key() {
+        let cfg = url_s3();
+        for url in ["http://minio:9000/uploads", "http://minio:9000/uploads/"] {
+            let err = resolve_input(url, &cfg).unwrap_err().to_string();
+            assert!(err.contains("no object key"), "for {url} got: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_url_first_segment_not_bucket() {
+        // A URL pointing elsewhere is rejected with an actionable message.
+        let cfg = url_s3();
+        let err = resolve_input("http://other-host:9000/otherbucket/workspaces/a.xlsx", &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uploads"), "message names the bucket: {err}");
+    }
+
+    #[test]
+    fn resolve_bare_host_url_has_no_key() {
+        let cfg = url_s3();
+        let err = resolve_input("http://minio:9000", &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no object key"), "message: {err}");
     }
 }

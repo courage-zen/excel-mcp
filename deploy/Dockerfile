@@ -1,5 +1,6 @@
 # excel-mcp container image.
-# Built in CI for linux/amd64 and linux/arm64; also buildable locally:
+# Built in CI for linux/amd64 and linux/arm64; also buildable locally
+# (requires network access to gcr.io for the distroless base):
 #   docker build -t excel-mcp -f deploy/Dockerfile .
 FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
@@ -15,10 +16,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --bin excel-mcp
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+# Distroless runtime: CA certs, libc/libm/libgcc_s, tzdata — no shell,
+# no package manager, runs as nonroot (uid 65532). Debug via
+# `kubectl logs` or port-forward + curl /health, not kubectl exec.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=builder /app/target/release/excel-mcp /usr/local/bin/excel-mcp
 
 ENV MCP_HOST=0.0.0.0 \

@@ -13,10 +13,14 @@ Three tools:
 - **`sheet_read`** — read one sheet: cells (values + formulas), merged
   ranges, sheet list. Values are recomputed with a formula engine
   ([IronCalc](https://ironcalc.com/)) when possible; cached values
-  (flagged `values_are_cached: true`) otherwise.
+  (flagged `values_are_cached: true`) otherwise. **`s3_key` also accepts
+  the full object-store URL of an attachment** (e.g. a platform
+  attachment's `url` field) — the server converts it to the key, so
+  agents don't need to download or parse files locally.
 - **`sheet_apply`** — edit an existing workbook (cell values/formulas,
   insert rows/columns, add/rename sheets) and write a new copy; the
-  source object is never modified.
+  source object is never modified. Pass the source workbook's URL or
+  S3 key as `s3_key` (URLs converted automatically).
 
 ## Example calls
 
@@ -86,7 +90,7 @@ Environment variables (see `.env.example` for the full annotated list):
 | `EXCEL_MAX_FILE_BYTES` | `104857600` | upload/download cap (100 MiB) |
 
 - `/health` is auth-exempt and returns `{"ok":true,"s3":"configured",
-  "version":"0.1.0"}` — the `s3` field tells you whether the S3 env is
+  "version":"0.1.3"}` — the `s3` field tells you whether the S3 env is
   complete.
 - `/mcp` requires `Authorization: Bearer <key>` when `MCP_AUTH_KEY` is set.
 - The MCP endpoint follows the Streamable HTTP transport: `initialize`,
@@ -113,6 +117,13 @@ docker run -p 8080:8080 -e MCP_AUTH_KEY=dev-key \
   excel-mcp
 ```
 
+The runtime image is distroless (`cc-debian12:nonroot`): it ships CA
+certificates, glibc and nothing else — no shell, so `kubectl exec -it … --
+/bin/sh` won't work; use `kubectl logs` or a port-forward plus
+`curl /health` instead. Local builds need network access to gcr.io for
+the distroless base (CI builds it directly). The server runs as the
+nonroot user (uid 65532).
+
 Integration tests (`--ignored`) spin up MinIO via testcontainers and run the
 full create→read→apply round trip:
 
@@ -138,8 +149,8 @@ agent 远程调用。所有文件 IO 走 S3（推荐同集群 MinIO）：agent �
 
 ```bash
 # 1. 构建并推送镜像（或从 GitHub Release 下载 tarball 后 docker load）
-docker build -t <registry>/excel-mcp:0.1.0 -f deploy/Dockerfile .
-docker push <registry>/excel-mcp:0.1.0
+docker build -t <registry>/excel-mcp:0.1.3 -f deploy/Dockerfile .
+docker push <registry>/excel-mcp:0.1.3
 
 # 2. 创建认证与 S3 凭证 secret
 kubectl create secret generic excel-mcp-auth \
@@ -174,8 +185,11 @@ Agent 的 MCP 配置（Streamable HTTP，带 Bearer 认证）：
 }
 ```
 
-接入后即可调用 `create_xlsx` / `sheet_read` / `sheet_apply` 三个工具，
-参数示例见上文英文部分的 Example calls。
+接入后即可调用 `create_xlsx` / `sheet_read` / `sheet_apply` 三个工具。
+`s3_key` 既接受 S3 key，也接受附件的完整对象存储 URL（如平台附件的
+`url` 字段，形如 `http://minio:9000/uploads/workspaces/.../file.xlsx`），
+服务端会自动去掉 endpoint 和 bucket 段转换成 key——agent 不需要下载
+附件到本地解析。参数示例见上文英文部分的 Example calls。
 
 ## License
 

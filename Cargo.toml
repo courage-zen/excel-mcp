@@ -1,6 +1,6 @@
 [package]
 name = "excel-mcp"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Excel .xlsx create/read/edit as a Streamable HTTP MCP server with S3-only IO"
@@ -10,7 +10,7 @@ rmcp = { version = "3", features = ["server", "macros", "transport-streamable-ht
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 object_store = { version = "0.14", features = ["aws"] }
-rust_xlsxwriter = { version = "0.102", features = ["zlib"] }
+rust_xlsxwriter = { version = "0.102" }
 calamine = "0.38"
 ironcalc = "0.9"
 umya-spreadsheet = "3"
@@ -39,3 +39,8 @@ integration = []
 [[bin]]
 name = "excel-mcp"
 path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

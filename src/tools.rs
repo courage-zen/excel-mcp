@@ -32,7 +32,8 @@ pub struct CreateXlsxArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SheetReadArgs {
-    /// S3 key of the workbook to read.
+    /// S3 key of the workbook to read, or the full object-store URL of an
+    /// attachment (converted to a key automatically).
     pub s3_key: String,
     /// Sheet name or 0-based index as string; default: first sheet.
     #[serde(default)]
@@ -51,7 +52,8 @@ fn default_max_rows() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SheetApplyArgs {
-    /// S3 key of the source workbook. Never modified.
+    /// S3 key of the source workbook, or its full object-store URL
+    /// (converted to a key automatically). Never modified.
     pub s3_key: String,
     /// S3 key for the edited copy (required, must end with .xlsx).
     pub output_key: String,
@@ -74,7 +76,7 @@ impl ExcelMcp {
     }
 
     #[tool(
-        description = "Create a new Excel (.xlsx) workbook from data: a 2-D array of cell values, or {\"sheets\":[{\"name\",\"rows\"}]} for several sheets. Strings starting with \"=\" are formulas. Returns the output s3_key and the file bytes base64-encoded when small."
+        description = "Create a new Excel (.xlsx) workbook from data: a 2-D array of cell values, or {\"sheets\":[{\"name\",\"rows\"}]} for several sheets. Strings starting with \"=\" are formulas. Prefer this over emitting CSV/markdown tables when the deliverable is a real spreadsheet. Returns the output s3_key and the file bytes base64-encoded when small."
     )]
     async fn create_xlsx(
         &self,
@@ -131,7 +133,7 @@ impl ExcelMcp {
     }
 
     #[tool(
-        description = "Read one sheet of an .xlsx workbook from S3: returns sheet list, cells (A1-keyed values plus formulas), merged ranges and a truncation flag. Values are recomputed with a formula engine when possible, else cached values are returned (values_are_cached=true)."
+        description = "Read one sheet of an .xlsx workbook from S3. Use this whenever you need data from an Excel file, including platform attachments whose URL points at the object store: pass the attachment's URL or its S3 key as s3_key (URLs are converted to keys automatically). Do NOT download attachments or parse xlsx files locally. Returns sheet list, cells (A1-keyed values plus formulas), merged ranges and a truncation flag. Values are recomputed with a formula engine when possible, else cached values are returned (values_are_cached=true)."
     )]
     async fn sheet_read(
         &self,
@@ -143,13 +145,13 @@ impl ExcelMcp {
                 None,
             )
         })?;
-        crate::s3keys::validate_input_key(&args.s3_key, &s3)
+        let resolved_key = crate::s3keys::resolve_input(&args.s3_key, &s3)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let store = crate::storage::client(&s3)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let store: Box<dyn object_store::ObjectStore> = Box::new(store);
         let max = self.cfg.max_file_bytes;
-        let tmp = crate::storage::fetch_to_tempfile(store.as_ref(), &args.s3_key, max)
+        let tmp = crate::storage::fetch_to_tempfile(store.as_ref(), &resolved_key, max)
             .await
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -171,7 +173,7 @@ impl ExcelMcp {
     }
 
     #[tool(
-        description = "Edit an .xlsx workbook from S3 and write a new copy: set cell values/formulas, insert rows/columns, add or rename sheets. The source object is never modified. Requires an explicit output_key ending in .xlsx."
+        description = "Edit an .xlsx workbook from S3 and write a new copy: set cell values/formulas, insert rows/columns, add or rename sheets. The source object is never modified. Pass the source workbook's URL or S3 key as s3_key (URLs are converted to keys automatically); output_key must be an S3 key ending in .xlsx."
     )]
     async fn sheet_apply(
         &self,
@@ -183,7 +185,7 @@ impl ExcelMcp {
                 None,
             )
         })?;
-        crate::s3keys::validate_input_key(&args.s3_key, &s3)
+        let resolved_key = crate::s3keys::resolve_input(&args.s3_key, &s3)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let output_key = crate::s3keys::normalize_output_key(&args.output_key)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -191,7 +193,7 @@ impl ExcelMcp {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let store: Box<dyn object_store::ObjectStore> = Box::new(store);
         let max = self.cfg.max_file_bytes;
-        let tmp = crate::storage::fetch_to_tempfile(store.as_ref(), &args.s3_key, max)
+        let tmp = crate::storage::fetch_to_tempfile(store.as_ref(), &resolved_key, max)
             .await
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -243,9 +245,12 @@ impl ServerHandler for ExcelMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Excel workbook tools over S3. create_xlsx builds a new .xlsx from data; \
+                "Excel workbook tools over S3 — use them instead of parsing xlsx files yourself. \
                  sheet_read returns cells, formulas and recomputed values for one sheet; \
-                 sheet_apply edits an existing workbook and writes a new copy.",
+                 sheet_apply edits an existing workbook and writes a new copy; \
+                 create_xlsx builds a new .xlsx from data. All inputs are S3 keys, but full \
+                 object-store URLs (e.g. platform attachment URLs) are accepted and converted \
+                 automatically — do not download attachments to parse them locally.",
             )
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -374,6 +379,103 @@ mod tests {
         assert!(
             msg.contains("..") || msg.contains("key"),
             "expected input-key rejection, got: {msg}"
+        );
+    }
+
+    /// S3 config for tools-level URL tests: unreachable endpoint so any
+    /// network attempt fails AFTER key validation, proving the URL was
+    /// accepted and converted.
+    fn url_cfg() -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            auth_keys: vec![],
+            s3: Some(crate::config::S3Config {
+                bucket: "uploads".into(),
+                region: "us-east-1".into(),
+                access_key_id: "ak".into(),
+                secret_access_key: "sk".into(),
+                endpoint_url: "http://127.0.0.1:1".into(),
+                use_path_style: true,
+                allowed_key_prefixes: vec![],
+            }),
+            output_prefix: "excel-mcp-out/".into(),
+            inline_max_bytes: 1024,
+            max_file_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn sheet_read_accepts_url_and_passes_validation() {
+        // The URL converts to key "workspaces/a.xlsx"; validation passes
+        // (no allowlist configured); the S3 fetch itself fails because the
+        // endpoint is unreachable — but with a fetch error, NOT a key error.
+        let server = ExcelMcp::new(url_cfg());
+        let result = server
+            .sheet_read(Parameters(SheetReadArgs {
+                s3_key: "http://127.0.0.1:1/uploads/workspaces/a.xlsx".into(),
+                sheet: None,
+                max_rows: 500,
+                format: None,
+            }))
+            .await;
+        let msg = match &result {
+            Err(e) => e.message.to_string(),
+            Ok(r) => extract_text(r).unwrap_or_default(),
+        };
+        assert!(
+            !msg.contains("does not match bucket")
+                && !msg.contains("no object key")
+                && !msg.contains("invalid s3 key"),
+            "URL should have been accepted, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sheet_read_rejects_url_with_traversal() {
+        let server = ExcelMcp::new(url_cfg());
+        let result = server
+            .sheet_read(Parameters(SheetReadArgs {
+                s3_key: "http://127.0.0.1:1/uploads/../etc/passwd".into(),
+                sheet: None,
+                max_rows: 500,
+                format: None,
+            }))
+            .await;
+        let msg = match &result {
+            Err(e) => e.message.to_string(),
+            Ok(r) => extract_text(r).unwrap_or_default(),
+        };
+        assert!(
+            msg.contains("invalid s3 key"),
+            "traversal in URL must be rejected as a key error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sheet_apply_accepts_url_and_passes_validation() {
+        // Mirror of the sheet_read accept test: the URL converts to a key,
+        // validation passes, and the failure (if any) comes from the
+        // unreachable endpoint — not from key rejection.
+        let server = ExcelMcp::new(url_cfg());
+        let result = server
+            .sheet_apply(Parameters(SheetApplyArgs {
+                s3_key: "http://127.0.0.1:1/uploads/workspaces/a.xlsx".into(),
+                output_key: "out/a.xlsx".into(),
+                sheet: None,
+                cells: vec![],
+                ops: vec![],
+            }))
+            .await;
+        let msg = match &result {
+            Err(e) => e.message.to_string(),
+            Ok(r) => extract_text(r).unwrap_or_default(),
+        };
+        assert!(
+            !msg.contains("does not match bucket")
+                && !msg.contains("no object key")
+                && !msg.contains("invalid s3 key"),
+            "URL should have been accepted, got: {msg}"
         );
     }
 }
